@@ -92,32 +92,37 @@ async function main() {
     }
     const cached = geoCache.get(ip);
     if (cached && Date.now() - cached.ts < GEO_CACHE_TTL) return cached.data;
+    const noGeo = { country: null, region: null, city: null, lat: null, lon: null, isp: null };
+    const makeGeo = (c,r,ci,la,lo,i) => ({ country: c||null, region: r||null, city: ci||null, lat: la||null, lon: lo||null, isp: i||null });
+    const cacheGeo = (g) => { geoCache.set(ip, { data: g, ts: Date.now() }); pruneGeoCache(); return g; };
     let fetchTimeout;
     try {
       const controller = new AbortController();
       fetchTimeout = setTimeout(() => controller.abort(), 5000);
-      if (!GEO_API_KEY) {
-        const r = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,lat,lon,isp`, { signal: controller.signal });
+      // 1. ipgeolocation.io (primary, requires GEO_API_KEY, HTTPS)
+      if (GEO_API_KEY) {
+        const r = await fetch(`https://api.ipgeolocation.io/ipgeo?apiKey=${GEO_API_KEY}&ip=${ip}&fields=country_name,state_prov,city,latitude,longitude,isp`, { signal: controller.signal });
         clearTimeout(fetchTimeout);
         const data = await r.json();
-        if (data.status === "success") {
-          const geo = { country: data.country || null, region: data.regionName || null, city: data.city || null, lat: data.lat || null, lon: data.lon || null, isp: data.isp || null };
-          geoCache.set(ip, { data: geo, ts: Date.now() }); pruneGeoCache();
-          return geo;
-        }
-        return { country: null, region: null, city: null, lat: null, lon: null, isp: null };
+        if (data.country_name) return cacheGeo(makeGeo(data.country_name, data.state_prov, data.city, data.latitude ? parseFloat(data.latitude) : null, data.longitude ? parseFloat(data.longitude) : null, data.isp));
       }
-      const r = await fetch(`https://api.ipgeolocation.io/ipgeo?apiKey=${GEO_API_KEY}&ip=${ip}&fields=country_name,state_prov,city,latitude,longitude,isp`, { signal: controller.signal });
+      // 2. ipwhois.app (free, HTTPS, no key needed — 10k/month)
+      try {
+        const c2 = new AbortController();
+        const t2 = setTimeout(() => c2.abort(), 5000);
+        const r2 = await fetch(`https://ipwhois.app/json/${ip}?fields=country,region,city,latitude,longitude,isp`, { signal: c2.signal });
+        clearTimeout(t2);
+        const d2 = await r2.json();
+        if (d2.country) return cacheGeo(makeGeo(d2.country, d2.region, d2.city, d2.latitude ? parseFloat(d2.latitude) : null, d2.longitude ? parseFloat(d2.longitude) : null, d2.isp));
+      } catch(e2) { console.error("ipwhois fallback error:", e2.message); }
+      // 3. ip-api.com (free, HTTP only — won't work on HTTPS deployments)
+      const r = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,lat,lon,isp`, { signal: controller.signal });
       clearTimeout(fetchTimeout);
       const data = await r.json();
-      if (data.country_name) {
-        const geo = { country: data.country_name || null, region: data.state_prov || null, city: data.city || null, lat: data.latitude ? parseFloat(data.latitude) : null, lon: data.longitude ? parseFloat(data.longitude) : null, isp: data.isp || null };
-        geoCache.set(ip, { data: geo, ts: Date.now() }); pruneGeoCache();
-        return geo;
-      }
+      if (data.status === "success") return cacheGeo(makeGeo(data.country, data.regionName, data.city, data.lat, data.lon, data.isp));
     } catch (e) { console.error("geo lookup error:", e.message); }
     if (fetchTimeout) clearTimeout(fetchTimeout);
-    return { country: null, region: null, city: null, lat: null, lon: null, isp: null };
+    return noGeo;
   }
 
   function parseUA(ua) {
@@ -585,8 +590,8 @@ ${isEmbed ? `#frame{position:fixed;inset:0;width:100%;height:100%;border:none;z-
 ${isEmbed ? `#loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:0.85rem;z-index:10;background:#0f1117;transition:opacity 0.3s;}` : ``}
 </style></head>
 <body>
-${isEmbed ? `<div id="loading"><p>Loading\u2026</p></div><iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : `<p>Redirecting\u2026</p>`}
-<noscript><meta http-equiv="refresh" content="0;url=${destEsc}"><p style="margin-top:1rem;text-align:center;"><a href="${destEsc}" style="color:var(--accent,#6366f1)">Continue</a></p></noscript>
+${isEmbed ? `<div id="loading"><p>Loading\u2026</p></div><iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : `<p>Redirecting\u2026</p><p style="margin-top:0.75rem;font-size:0.8rem;"><a href="${destEsc}" style="color:#818cf8;">Click here if not redirected</a></p>`}
+<meta http-equiv="refresh" content="6;url=${destEsc}"><noscript><meta http-equiv="refresh" content="0;url=${destEsc}"><p style="margin-top:1rem;text-align:center;"><a href="${destEsc}" style="color:var(--accent,#6366f1)">Continue</a></p></noscript>
 <script>
 const SLUG = ${JSON.stringify(slug).replace(/<\/script/gi, '<\\/script')};
 const DEST = ${JSON.stringify(destination).replace(/<\/script/gi, '<\\/script')};
