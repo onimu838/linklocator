@@ -1,4 +1,5 @@
 require("dotenv").config();
+if (typeof globalThis.WebSocket === "undefined") globalThis.WebSocket = require("ws");
 const express = require("express");
 const { nanoid } = require("nanoid");
 const { createClient } = require("@supabase/supabase-js");
