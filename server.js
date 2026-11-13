@@ -60,6 +60,94 @@ async function main() {
 
   const BASE_URL = process.env.BASE_URL || "";
 
+  // ─── Visitor cookie tracking ────────────────────────────────────
+  const VISITOR_COOKIE = "ll_vid";
+  const VISITOR_TTL = 365 * 24 * 60 * 60 * 1000; // 1 year
+
+  function getVisitorId(req) {
+    return req.cookies?.[VISITOR_COOKIE] || null;
+  }
+
+  app.use((req, res, next) => {
+    // Parse cookies (lightweight, no library needed)
+    const hdr = req.headers.cookie || "";
+    req.cookies = {};
+    hdr.split(';').forEach(c => {
+      const i = c.indexOf('=');
+      if (i > 0) req.cookies[c.substring(0, i).trim()] = c.substring(i + 1).trim();
+    });
+    next();
+  });
+
+  // ─── 1x1 Transparent GIF (tracking pixel) ─────────────────────
+  // Smallest valid GIF: 43 bytes
+  const PIXEL_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+
+  app.get("/api/pixel/:slug", asyncHandler(async (req, res) => {
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
+    if (linkErr) throw linkErr;
+    if (!link || !link.active) {
+      // Still return the pixel even for inactive/missing links (no info leakage)
+      res.setHeader('Content-Type', 'image/gif');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      return res.send(PIXEL_GIF);
+    }
+
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
+    const referrer = req.headers.referer || null;
+    const ua = req.headers["user-agent"] || null;
+    const visitorId = getVisitorId(req) || null;
+
+    // Client Hints
+    const chUa = req.headers["sec-ch-ua"] || null;
+    const chPlatform = req.headers["sec-ch-ua-platform"] || null;
+    const chUaMobile = req.headers["sec-ch-ua-mobile"] || null;
+    let browser = null, os = null, deviceType = null;
+    if (chUa) {
+      try {
+        const brands = chUa.split(',').map(b => b.trim());
+        for (const b of brands) {
+          const m = b.match(/^"([^"]+)";v="([^"]+)"$/);
+          if (m && !m[1].startsWith('Not') && m[1] !== 'Chromium' && m[1] !== 'Not(A:Brand') { browser = m[1] + ' ' + m[2]; break; }
+        }
+      } catch {}
+    }
+    if (chPlatform) { try { os = JSON.parse(chPlatform); } catch { os = chPlatform; } }
+    if (chUaMobile === '"?1"' || chUaMobile === '?1') deviceType = 'mobile';
+    else if (chUaMobile === '"?0"' || chUaMobile === '?0') deviceType = 'desktop';
+    if (!browser || !os || !deviceType) {
+      const parsed = parseUA(ua);
+      if (!browser) browser = parsed.browser;
+      if (!os) os = parsed.os;
+      if (!deviceType) deviceType = parsed.deviceType;
+    }
+
+    const geo = await lookupGeo(ip);
+
+    // Fire-and-forget insert
+    supabase.from("clicks").insert({
+      link_id: link.id, ip, referrer, user_agent: ua,
+      country: geo.country, region: geo.region, city: geo.city,
+      lat: geo.lat, lon: geo.lon, isp: geo.isp,
+      browser, os, device_type: deviceType,
+      visitor_id: visitorId
+    }).then(({ error }) => { if (error) console.error("pixel click insert error:", error.message); });
+
+    // Fire conversion webhook if configured
+    fireWebhook(link, { ip, referrer, country: geo.country, region: geo.region, city: geo.city, lat: geo.lat, lon: geo.lon, browser, os, device_type: deviceType, visitor_id: visitorId || req.body?.visitor_id || null });
+
+    // Set visitor cookie if not present
+    if (!visitorId) {
+      const vid = 'v_' + nanoid(12);
+      res.setHeader('Set-Cookie', `${VISITOR_COOKIE}=${vid}; Path=/; Max-Age=${Math.floor(VISITOR_TTL/1000)}; SameSite=Lax; HttpOnly`);
+    }
+
+    res.setHeader('Content-Type', 'image/gif');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.send(PIXEL_GIF);
+  }));
+
   // ─── Geo IP lookup ─────────────────────────────────────────────
   const GEO_API_KEY = process.env.GEO_API_KEY;
   const geoCache = new Map();
@@ -166,7 +254,7 @@ async function main() {
   // ─── API: Create Link ──────────────────────────────────────────
   app.post("/api/links", asyncHandler(async (req, res) => {
     if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
-    const { destination, label, slug: customSlug, tracking_mode, gps_interval, max_pings } = req.body;
+    const { destination, label, slug: customSlug, tracking_mode, gps_interval, max_pings, webhook_url } = req.body;
     if (!destination) return res.status(400).json({ error: "destination is required" });
     try { const u = new URL(destination); if (!["http:","https:"].includes(u.protocol)) return res.status(400).json({ error: "only http/https destinations allowed" }); if (u.href.startsWith("//")) return res.status(400).json({ error: "protocol-relative URLs not allowed" }); } catch { return res.status(400).json({ error: "invalid destination URL" }); }
     try { const dest = new URL(destination); const self = new URL(baseUrl(req)); if (dest.origin === self.origin) return res.status(400).json({ error: "destination cannot point to this app" }); } catch {}
@@ -181,7 +269,7 @@ async function main() {
     if (!/^[a-zA-Z0-9_-]+$/.test(slug)) return res.status(400).json({ error: "slug must be alphanumeric, hyphens, or underscores only" });
     if (slug.length > 64) return res.status(400).json({ error: "slug too long (max 64)" });
     if (slug.length < 1) return res.status(400).json({ error: "slug too short" });
-    const RESERVED = ["api", "health", "links", "sms", "whoami", "click", "favicon", "robots"];
+    const RESERVED = ["api", "health", "links", "sms", "whoami", "click", "favicon", "robots", "pixel"];
     if (RESERVED.includes(slug.toLowerCase())) return res.status(400).json({ error: `slug '${slug}' is reserved` });
 
     const { data: existing } = await supabase.from("links").select("id").eq("slug", slug).maybeSingle();
@@ -212,7 +300,7 @@ async function main() {
 
     const { data: link, error: insertErr } = await supabase.from("links").insert({
       slug, destination, label: label || null, tracking_mode: validMode,
-      gps_interval: interval, max_pings: maxPings
+      gps_interval: interval, max_pings: maxPings, webhook_url: webhook_url || null
     }).select().single();
     if (insertErr) throw insertErr;
 
@@ -245,7 +333,7 @@ async function main() {
     res.json({
       ...link, active: !!link.active,
       short_url: `${baseUrl(req)}/${link.slug}`,
-      stats: { total: Number(stats.total || 0), unique_ips: Number(stats.unique_ips || 0), first_click: stats.first_click || null, last_click: stats.last_click || null },
+      stats: { total: Number(stats.total || 0), unique_ips: Number(stats.unique_ips || 0), unique_visitors: Number(stats.unique_visitors || 0), first_click: stats.first_click || null, last_click: stats.last_click || null },
       by_day: byDayRes.data || [],
       by_country: byCountryRes.data || [],
       by_city: byCityRes.data || [],
@@ -269,13 +357,14 @@ async function main() {
     const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
     if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: "link not found" });
-    const { tracking_mode, gps_interval, max_pings, label, destination } = req.body;
+    const { tracking_mode, gps_interval, max_pings, label, destination, webhook_url } = req.body;
     const updates = {};
     if (tracking_mode === "redirect" || tracking_mode === "embed") updates.tracking_mode = tracking_mode;
     if (typeof gps_interval === "number" && gps_interval >= 5 && gps_interval <= 3600) updates.gps_interval = Math.round(gps_interval);
     if (typeof max_pings === "number" && max_pings >= 0 && max_pings <= 10000) updates.max_pings = Math.round(max_pings);
     if (typeof label === "string") updates.label = label.slice(0, 200);
     if (typeof destination === "string" && /^https?:\/\//i.test(destination) && destination.length <= 2048) updates.destination = destination;
+    if (typeof webhook_url === "string") updates.webhook_url = webhook_url.length > 0 ? webhook_url.slice(0, 2048) : null;
     if (!Object.keys(updates).length) return res.status(400).json({ error: "no valid fields to update" });
     const { data: updated, error: updErr } = await supabase.from("links").update(updates).eq("id", link.id).select().single();
     if (updErr) throw updErr;
@@ -405,9 +494,20 @@ async function main() {
       link_id: link.id, ip, referrer, user_agent: ua,
       country: geo.country, region: geo.region, city: geo.city,
       lat: clickLat, lon: clickLon, isp: geo.isp, gps_accuracy: clickAcc,
-      browser, os, device_type: deviceType, device_json: Object.keys(deviceJson).length ? deviceJson : null
+      browser, os, device_type: deviceType, device_json: Object.keys(deviceJson).length ? deviceJson : null,
+      visitor_id: req.body.visitor_id || getVisitorId(req) || null
     }).select("id").single();
     if (clickErr) throw clickErr;
+
+    // Set visitor cookie if not present
+    if (!getVisitorId(req)) {
+      const vid = 'v_' + nanoid(12);
+      res.setHeader('Set-Cookie', `${VISITOR_COOKIE}=${vid}; Path=/; Max-Age=${Math.floor(VISITOR_TTL/1000)}; SameSite=Lax; HttpOnly`);
+    }
+
+    // Fire conversion webhook if configured (fire-and-forget)
+    const clickData = { click_id: clickRow?.id, ip, referrer, country: geo.country, region: geo.region, city: geo.city, lat: clickLat, lon: clickLon, browser, os, device_type: deviceType, visitor_id: req.body.visitor_id || getVisitorId(req) };
+    fireWebhook(link, clickData);
 
     res.json({ ok: true, click_id: clickRow?.id || null });
   }));
@@ -575,6 +675,32 @@ async function main() {
     console.log(`    DB:         Supabase\n`);
   });
   server.timeout = 30000;
+  // ─── Conversion Webhook forwarding ──────────────────────────────
+  async function fireWebhook(link, clickData) {
+    if (!link.webhook_url) return;
+    try {
+      const payload = {
+        event: 'click',
+        slug: link.slug,
+        destination: link.destination,
+        label: link.label,
+        click: clickData,
+        timestamp: new Date().toISOString()
+      };
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 5000);
+      const r = await fetch(link.webhook_url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      console.log(`🪝 Webhook fired for ${link.slug} → ${r.status}`);
+    } catch (e) {
+      console.error(`🪝 Webhook error for ${link.slug}:`, e.message);
+    }
+  }
+
 }
 
 function interstitialHTML(slug, destination, trackingMode, gpsInterval, maxPings) {
@@ -598,6 +724,23 @@ const DEST = ${JSON.stringify(destination).replace(/<\/script/gi, '<\\/script')}
 let CLICK_ID = null;
 let clickPosted = false;
 let redirected = false;
+
+// ─── Visitor tracking (cookie + localStorage) ──────────
+const VID_KEY = 'll_vid';
+let VISITOR_ID = null;
+try {
+  // Try cookie first
+  const ck = document.cookie.split(';').find(c => c.trim().startsWith(VID_KEY + '='));
+  if (ck) VISITOR_ID = ck.split('=')[1].trim();
+  // Fallback to localStorage
+  if (!VISITOR_ID) VISITOR_ID = localStorage.getItem(VID_KEY);
+  // Generate new if neither found
+  if (!VISITOR_ID) {
+    VISITOR_ID = 'v_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    document.cookie = VID_KEY + '=' + VISITOR_ID + '; Path=/; Max-Age=31536000; SameSite=Lax';
+    try { localStorage.setItem(VID_KEY, VISITOR_ID); } catch(e) {}
+  }
+} catch(e) {}
 
 // ─── Device fingerprint collection ─────────────
 function collectDeviceInfo() {
@@ -692,7 +835,7 @@ function collectDeviceInfo() {
 const DEVICE_INFO = collectDeviceInfo();
 
 function postClick(data) {
-  const payload = { ...data, device_info: DEVICE_INFO };
+  const payload = { ...data, device_info: DEVICE_INFO, visitor_id: VISITOR_ID };
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
   return fetch('/api/click', { method: 'POST', body: blob, keepalive: true })
     .then(r => r.json())
@@ -751,7 +894,7 @@ clickPosted = false;
 function postAndRedirect(gpsData) {
   if (!clickPosted) {
     clickPosted = true;
-    const payload = gpsData ? { slug: SLUG, ...gpsData, device_info: DEVICE_INFO } : { slug: SLUG, device_info: DEVICE_INFO };
+    const payload = gpsData ? { slug: SLUG, ...gpsData, device_info: DEVICE_INFO, visitor_id: VISITOR_ID } : { slug: SLUG, device_info: DEVICE_INFO, visitor_id: VISITOR_ID };
     const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
     if (navigator.sendBeacon) { navigator.sendBeacon('/api/click', blob); }
     else { fetch('/api/click', { method: 'POST', body: blob, keepalive: true }).catch(() => {}); }
@@ -864,7 +1007,7 @@ function dashboardHTML() {
         <label>Label (optional)</label>
         <input type="text" id="labelInput" placeholder="Campaign name">
       </div>
-      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>Max pings</label><input type="number" id="maxPingsInput" value="100" min="0" max="10000" placeholder="100"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
+      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>Max pings</label><input type="number" id="maxPingsInput" value="100" min="0" max="10000" placeholder="100"></div><div class="form-group" style="flex:1.2;min-width:180px;"><label>Webhook URL (optional)</label><input type="url" id="webhookInput" placeholder="https://graph.facebook.com/.../events"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
     </form>
   </div>
   <div class="card" id="linksCard">
@@ -920,6 +1063,7 @@ async function loadLinks(){
     <td>\${fmtDate(l.created_at)}</td>
     <td class="actions">
       <button class="btn-sm btn-primary" data-slug="\${esc(l.slug)}" onclick="viewDetail(this.dataset.slug)">Details</button>
+      <button class="btn-sm" style="background:#7c3aed;color:#fff;" data-pixel="\${location.origin}/api/pixel/\${esc(l.slug)}" onclick="copyUrl(this.dataset.pixel)">Pixel</button>
       <button class="btn-sm" style="background:#2563eb;color:#fff;" data-slug="\${esc(l.slug)}" data-url="\${location.origin}/\${esc(l.slug)}" onclick="sendSMS(this.dataset.slug,this.dataset.url)">Text</button>
       <button class="btn-sm btn-muted" data-slug="\${esc(l.slug)}" onclick="toggleLink(this.dataset.slug)">\${l.active?'Pause':'Resume'}</button>
       <button class="btn-sm btn-danger" data-slug="\${esc(l.slug)}" onclick="deleteLink(this.dataset.slug)">Delete</button>
@@ -934,8 +1078,9 @@ document.getElementById('createForm').addEventListener('submit',async e=>{
   const tracking_mode=document.getElementById('trackingInput').value;
   const gps_interval=parseInt(document.getElementById('intervalInput').value)||30;
   const max_pings=parseInt(document.getElementById('maxPingsInput').value)||100;
-  try{const r=await api('POST','/api/links',{destination:dest,slug,label,tracking_mode,gps_interval,max_pings});if(r.error){showToast('Error: '+r.error);return;}
-  document.getElementById('destInput').value='';document.getElementById('slugInput').value='';document.getElementById('labelInput').value='';
+  const webhook_url=document.getElementById('webhookInput').value.trim()||undefined;
+  try{const r=await api('POST','/api/links',{destination:dest,slug,label,tracking_mode,gps_interval,max_pings,webhook_url});if(r.error){showToast('Error: '+r.error);return;}
+  document.getElementById('destInput').value='';document.getElementById('slugInput').value='';document.getElementById('labelInput').value='';document.getElementById('webhookInput').value='';
   showToast('Link created!');if(r.iframe_warning)setTimeout(()=>showToast('\u26a0\ufe0f '+r.iframe_warning),2600);loadLinks();}catch(e){showToast('Error creating link');}
 });
 async function toggleLink(s){const r=await api('PATCH','/api/links/'+s+'/toggle');if(r.error)showToast('Error: '+r.error);else loadLinks();}
@@ -946,7 +1091,7 @@ let viewDetail_clicks=[];async function viewDetail(slug){
   const st=data.stats||{};
   const maxDay=Math.max(...(data.by_day||[]).map(d=>d.count),1);
   const dayBars=(data.by_day||[]).slice(0,14).reverse().map(d=>'<div class="bar-row"><span class="bar-label">'+d.day.slice(5)+'</span><div class="bar-fill" style="width:'+(d.count/maxDay*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('');
-  const cRows=(data.recent_clicks||[]).slice(0,50).map(c=>{const gps=c.gps_accuracy!=null;const hasCoords=c.lat!=null&&c.lon!=null;const locStr=hasCoords?'<a href="#" onclick="showStreetView('+c.lat+','+c.lon+');return false;" style="color:var(--accent);cursor:pointer;text-decoration:none;">'+(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> '+(c.lat.toFixed(4)+', '+c.lon.toFixed(4))+' <span style="color:var(--muted);font-size:0.55rem;">\u00b1'+Math.round(c.gps_accuracy)+'m</span>':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>')+' \ud83c\udfe0</a>':(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> \u2014':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>');const devIcon=c.device_type==='mobile'?'\ud83d\udcf1':c.device_type==='tablet'?'\ud83d\udcf5':'\ud83d\udda5';const devLabel=esc(c.browser||'')||esc((c.user_agent||'').slice(0,25));const devSub=esc(c.os||'');const devTitle=[c.browser,c.os,c.device_type,c.device_json?JSON.stringify(c.device_json).slice(0,200):'',c.user_agent].filter(Boolean).join('\\n');return '<tr><td>'+fmtDT(c.clicked_at)+'</td><td>'+esc(c.ip)+'</td><td>'+locStr+'</td><td title="'+devTitle+'"><span style="cursor:pointer;" onclick="showDeviceInfo('+(c.id||0)+')">'+devIcon+' <strong>'+devLabel+'</strong>'+(devSub?'<br><span style="color:var(--muted);font-size:0.6rem;">'+devSub+'</span>':'')+'</span></td><td title="'+esc(c.referrer)+'">'+(esc((c.referrer||'').slice(0,25))||'Direct')+'</td></tr>';}).join('');
+  const cRows=(data.recent_clicks||[]).slice(0,50).map(c=>{const gps=c.gps_accuracy!=null;const hasCoords=c.lat!=null&&c.lon!=null;const locStr=hasCoords?'<a href="#" onclick="showStreetView('+c.lat+','+c.lon+');return false;" style="color:var(--accent);cursor:pointer;text-decoration:none;">'+(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> '+(c.lat.toFixed(4)+', '+c.lon.toFixed(4))+' <span style="color:var(--muted);font-size:0.55rem;">\u00b1'+Math.round(c.gps_accuracy)+'m</span>':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>')+' \ud83c\udfe0</a>':(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> \u2014':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>');const devIcon=c.device_type==='mobile'?'\ud83d\udcf1':c.device_type==='tablet'?'\ud83d\udcf5':'\ud83d\udda5';const devLabel=esc(c.browser||'')||esc((c.user_agent||'').slice(0,25));const devSub=esc(c.os||'');const vidStr=c.visitor_id?"<br><span style="font-size:0.55rem;color:var(--muted);">vid:"+esc(c.visitor_id).slice(0,10)+"</span>":"";const devTitle=[c.browser,c.os,c.device_type,c.device_json?JSON.stringify(c.device_json).slice(0,200):'',c.user_agent].filter(Boolean).join('\\n');return '<tr><td>'+fmtDT(c.clicked_at)+'</td><td>'+esc(c.ip)+'</td><td>'+locStr+'</td><td title="'+devTitle+'"><span style="cursor:pointer;" onclick="showDeviceInfo('+(c.id||0)+')">'+devIcon+' <strong>'+devLabel+'</strong>'+(devSub?'<br><span style="color:var(--muted);font-size:0.6rem;">'+devSub+'</span>':'')+vidStr+'</span></td><td title="'+esc(c.referrer)+'">'+(esc((c.referrer||'').slice(0,25))||'Direct')+'</td></tr>';}).join('');
   let countryBars='',cityBars='';
   if(data.by_country&&data.by_country.length){const mx=Math.max(...data.by_country.map(x=>x.count),1);countryBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By Country</h3><div class="bar-chart">'+data.by_country.map(d=>'<div class="bar-row"><span class="bar-label">'+flagEmoji(d.country)+' '+esc(d.country)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
   if(data.by_city&&data.by_city.length){const mx=Math.max(...data.by_city.map(x=>x.count),1);cityBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By City</h3><div class="bar-chart">'+data.by_city.map(d=>'<div class="bar-row"><span class="bar-label">'+esc(d.city)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
@@ -977,7 +1122,15 @@ let viewDetail_clicks=[];async function viewDetail(slug){
     '<div class="form-group" style="flex:0.6;min-width:120px;"><label>Mode</label><select id="editTracking" style="font-size:0.8rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.4rem 0.6rem;"><option value="redirect"'+(isEmbed?'':' selected')+'>Redirect</option><option value="embed"'+(isEmbed?' selected':'')+'>Embed + GPS</option></select></div>'+
     '<div class="form-group" style="flex:0.4;min-width:80px;"><label>GPS interval (s)</label><input type="number" id="editInterval" value="'+(data.gps_interval||30)+'" min="5" max="3600" style="font-size:0.8rem;padding:0.4rem 0.6rem;"></div>'+
     '<div class="form-group" style="flex:0.4;min-width:80px;"><label>Max pings</label><input type="number" id="editMaxPings" value="'+(data.max_pings||100)+'" min="0" max="10000" style="font-size:0.8rem;padding:0.4rem 0.6rem;"></div>'+
+    '</div>'+
+    '<div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:flex-end;margin-top:0.5rem;">'+
+    '<div class="form-group" style="flex:2;min-width:200px;"><label>Webhook URL</label><input type="url" id="editWebhook" value="'+esc(data.webhook_url||'')+'" placeholder="https://graph.facebook.com/.../events" style="font-size:0.8rem;padding:0.4rem 0.6rem;"><div style="font-size:0.6rem;color:var(--muted);margin-top:0.2rem;">Click events are POSTed here (Facebook CAPI, Google, Zapier, etc.)</div></div>'+
     '<button class="btn-primary btn-sm" onclick="saveLinkSettings(&apos;'+esc(data.slug)+'&apos;)" style="height:32px;">Save</button>'+
+    '</div>'+
+    '<div style="margin-top:0.5rem;padding:0.6rem 0.75rem;background:var(--bg);border-radius:8px;font-size:0.7rem;">'+
+    '<strong style="color:var(--accent);">\ud83d\udd34 Pixel URL:</strong> <span style="font-family:monospace;color:var(--text);">'+location.origin+'/api/pixel/'+esc(data.slug)+'</span> '+
+    '<button class="btn-sm btn-muted" style="font-size:0.6rem;margin-left:0.5rem;" onclick="copyUrl(\''+location.origin+'/api/pixel/'+esc(data.slug)+'\')">Copy</button>'+
+    '<div style="color:var(--muted);margin-top:0.3rem;">Embed in emails: <code style="font-size:0.65rem;">&lt;img src="'+location.origin+'/api/pixel/'+esc(data.slug)+'" width="1" height="1"&gt;</code></div>'+
     '</div>';
   document.getElementById('modalContent').innerHTML=
     '<button class="close-btn" onclick="closeModal()">\u2715</button>'+
@@ -986,6 +1139,7 @@ let viewDetail_clicks=[];async function viewDetail(slug){
     '<div class="stat-grid">'+
       '<div class="stat-box"><div class="val">'+(st.total||0)+'</div><div class="lbl">Total Clicks</div></div>'+
       '<div class="stat-box"><div class="val">'+(st.unique_ips||0)+'</div><div class="lbl">Unique IPs</div></div>'+
+      '<div class="stat-box"><div class="val">'+(st.unique_visitors||0)+'</div><div class="lbl">Unique Visitors</div></div>'+
       '<div class="stat-box"><div class="val">'+fmtDate(st.first_click)+'</div><div class="lbl">First Click</div></div>'+
       '<div class="stat-box"><div class="val">'+fmtDate(st.last_click)+'</div><div class="lbl">Last Click</div></div>'+
     '</div>'+
@@ -1002,7 +1156,8 @@ async function saveLinkSettings(slug){
   const tracking_mode=document.getElementById('editTracking').value;
   const gps_interval=parseInt(document.getElementById('editInterval').value)||30;
   const max_pings=parseInt(document.getElementById('editMaxPings').value)||100;
-  const r=await api('PATCH','/api/links/'+slug,{tracking_mode,gps_interval,max_pings});
+  const webhook_url=document.getElementById('editWebhook').value.trim()||null;
+  const r=await api('PATCH','/api/links/'+slug,{tracking_mode,gps_interval,max_pings,webhook_url});
   if(r.error){showToast('Error: '+r.error);return;}
   showToast('Settings saved');
   loadLinks();
@@ -1015,7 +1170,7 @@ function showDeviceInfo(clickId){
   const dj=c.device_json||{};
   const rows=[];
   // Core
-  if(c.browser)rows.push(['Browser','<strong>'+esc(c.browser)+'</strong>']);
+  if(c.visitor_id)rows.push(['Visitor ID','<span style="font-family:monospace;font-size:0.7rem;">'+esc(c.visitor_id)+'</span>']);if(c.browser)rows.push(['Browser','<strong>'+esc(c.browser)+'</strong>']);
   if(c.os)rows.push(['OS',esc(c.os)]);
   if(c.device_type)rows.push(['Device Type',esc(c.device_type)]);
   // Client Hints
