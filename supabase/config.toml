@@ -1,5 +1,5 @@
 [project]
-id = ""
+id = "kyvnpnzbiolgoblqqzdh"
 
 [api]
 port = 54321
@@ -13,8 +13,8 @@ port = 54322
 port = 54323
 
 [auth]
-site_url = "http://localhost:3000"
-additional_redirect_urls = ["http://localhost:3000"]
+site_url = "https://linklocator-production.up.railway.app"
+additional_redirect_urls = ["https://linklocator-production.up.railway.app"]
 
 [auth.email]
 enable_signup = true
